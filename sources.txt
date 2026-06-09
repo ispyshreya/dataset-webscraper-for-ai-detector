@@ -1,0 +1,6 @@
+# Put one page URL per line here.
+# Example sources for gathering image dataset metadata.
+https://unsplash.com/s/photos/nature
+https://www.pexels.com/search/portrait/
+https://www.flickr.com/search/?text=landscape
+# Add more pages that are allowed to be scraped and contain images.
