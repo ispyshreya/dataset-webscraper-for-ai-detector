@@ -28,19 +28,25 @@ pip install requests beautifulsoup4 pillow urllib3
 
 ### Run the scraper
 
+Use the repo virtual environment if you have already installed the dependencies there:
+
+```powershell
+.venv\Scripts\python.exe Script.py --sources sources.txt --target-new-images 10000 --pages-per-source 100 --max-images-per-page 0 --target-count 0 --delay 0.25 --ignore-robots
+```
+
 Use explicit source files for real and AI sources whenever possible:
 
 ```powershell
-& 'C:\Program Files\Git\cmd\git.exe' git config --global user.name "Your Name"
-& 'C:\Program Files\Git\cmd\git.exe' git config --global user.email "you@example.com"
-python Script.py --real-sources real_sources.txt --ai-sources ai_sources.txt --output-dir dataset --csv dataset.csv --target-count 10000 --train-ratio 0.8 --val-ratio 0.1 --size 224
+.venv\Scripts\python.exe Script.py --real-sources real_sources.txt --ai-sources ai_sources.txt --output-dir dataset --csv dataset.csv --target-new-images 10000 --pages-per-source 100 --max-images-per-page 0 --target-count 0 --train-ratio 0.8 --val-ratio 0.1 --size 224
 ```
 
-If you prefer a generic source list, use:
+Key controls:
 
-```powershell
-python Script.py --sources sources.txt --output-dir dataset --csv dataset.csv --target-count 10000 --train-ratio 0.8 --val-ratio 0.1 --size 224
-```
+- `--target-new-images 10000` means "add 10,000 new non-duplicate images in this run."
+- `--target-count 0` disables the older cumulative per-label cap, so repeated runs can keep adding fresh images.
+- `--pages-per-source 100` expands URLs such as `...?text=landscape` into paginated variants.
+- `--max-images-per-page 0` inspects every discovered image on each page.
+- `--ignore-robots` is required for sources whose `robots.txt` blocks scraping; only use it when you understand the site's policy and legal implications.
 
 ## Output structure
 

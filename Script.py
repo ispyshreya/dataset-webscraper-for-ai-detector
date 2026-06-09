@@ -10,13 +10,14 @@ import urllib.parse
 import urllib.robotparser
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple, cast
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from PIL import Image, ExifTags
+import shutil
 
 # Heuristic keywords for initial label suggestions.
 AI_HINTS = [
@@ -49,7 +50,13 @@ KNOWN_REAL_DOMAINS = [
 ]
 
 HEADERS = {
-    "User-Agent": "dataset-scraper/1.0 (+https://github.com/yourname)"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
 }
 
 IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"]
@@ -77,14 +84,20 @@ def parse_arguments():
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=20,
-        help="Maximum number of source pages to scrape.",
+        default=0,
+        help="Maximum number of expanded source pages to scrape. Use 0 for no limit.",
+    )
+    parser.add_argument(
+        "--pages-per-source",
+        type=int,
+        default=1,
+        help="Generate this many paginated variants for each source URL when possible.",
     )
     parser.add_argument(
         "--max-images-per-page",
         type=int,
-        default=50,
-        help="Maximum number of images to collect from each page.",
+        default=0,
+        help="Maximum number of images to inspect from each page. Use 0 for no limit.",
     )
     parser.add_argument(
         "--delay",
@@ -105,8 +118,14 @@ def parse_arguments():
     parser.add_argument(
         "--target-count",
         type=int,
+        default=0,
+        help="Optional cumulative target number of images per label (real and ai). Use 0 for no cumulative cap.",
+    )
+    parser.add_argument(
+        "--target-new-images",
+        type=int,
         default=10000,
-        help="Target number of images per label (real and ai).",
+        help="Target number of new, non-duplicate images to add during this run.",
     )
     parser.add_argument(
         "--train-ratio",
@@ -151,6 +170,16 @@ def parse_arguments():
         help="Maximum Hamming distance for perceptual duplicate detection.",
     )
     parser.add_argument(
+        "--ignore-robots",
+        action="store_true",
+        help="Ignore robots.txt checks and scrape page content regardless of robots rules.",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Delete existing dataset files and metadata before starting a fresh run.",
+    )
+    parser.add_argument(
         "--random-seed",
         type=int,
         default=42,
@@ -170,6 +199,17 @@ def read_source_urls(path: str):
             if stripped and not stripped.startswith("#"):
                 urls.append(stripped)
     return urls
+
+
+def expand_paginated_url(url: str, page_number: int) -> str:
+    if page_number <= 1:
+        return url
+
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    query["page"] = [str(page_number)]
+    expanded_query = urllib.parse.urlencode(query, doseq=True)
+    return urllib.parse.urlunparse(parsed._replace(query=expanded_query))
 
 
 def is_allowed_by_robots(url: str, user_agent: str = "*") -> bool:
@@ -221,16 +261,29 @@ def parse_images_from_html(page_url: str, html: str):
     )
 
     for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
+        src = (
+            img.get("src")
+            or img.get("data-src")
+            or img.get("data-lazy-src")
+            or img.get("data-srcset")
+            or img.get("srcset")
+        )
+        src = str(src or "").strip()
         if not src:
             continue
+
+        if "," in src and "srcset" in img.attrs:
+            src = src.split(",")[0].strip().split(" ")[0]
 
         image_url = normalize_image_url(page_url, src)
         if not image_url:
             continue
+        normalized_lower = image_url.lower()
+        if normalized_lower.startswith("data:") or normalized_lower.endswith(".svg"):
+            continue
 
-        alt_text = (img.get("alt") or "").strip()
-        title_text = (img.get("title") or "").strip()
+        alt_text = str(img.get("alt") or "").strip()
+        title_text = str(img.get("title") or "").strip()
         images.append(
             {
                 "page_url": page_url,
@@ -247,7 +300,9 @@ def parse_images_from_html(page_url: str, html: str):
 def download_image(image_url: str, session: requests.Session, timeout: int = 20):
     response = session.get(image_url, timeout=timeout)
     response.raise_for_status()
-    content_type = response.headers.get("Content-Type", "")
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "svg" in content_type or image_url.lower().endswith(".svg"):
+        raise ValueError(f"Unsupported SVG image skipped: {image_url}")
     if not content_type.startswith("image"):
         raise ValueError(f"Not an image: {image_url} ({content_type})")
 
@@ -258,7 +313,7 @@ def resize_and_save_image(image_bytes: bytes, output_path: Path, size: int):
     try:
         img = Image.open(BytesIO(image_bytes))
         img = img.convert("RGB")
-        img = img.resize((size, size), Image.LANCZOS)
+        img = img.resize((size, size), resample=Image.Resampling.LANCZOS)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         img.save(output_path, format="JPEG", quality=95)
     except Exception as exc:
@@ -267,8 +322,18 @@ def resize_and_save_image(image_bytes: bytes, output_path: Path, size: int):
 
 def compute_perceptual_hash(image_bytes: bytes, hash_size: int = 8) -> str:
     img = Image.open(BytesIO(image_bytes)).convert("L")
-    img = img.resize((hash_size, hash_size), Image.LANCZOS)
-    pixels = list(img.getdata())
+    img = img.resize((hash_size, hash_size), resample=Image.Resampling.LANCZOS)
+    get_pixels = getattr(img, "get_flattened_data", None)
+    raw_pixels: Any = get_pixels() if callable(get_pixels) else img.getdata()
+    raw_pixels = list(raw_pixels)
+    pixels = []
+    for pixel in raw_pixels:
+        if isinstance(pixel, tuple):
+            pixels.append(int(pixel[0]))
+        elif pixel is None:
+            pixels.append(0)
+        else:
+            pixels.append(int(pixel))
     avg = sum(pixels) / len(pixels)
     bits = ["1" if pixel > avg else "0" for pixel in pixels]
     return "".join(bits)
@@ -328,6 +393,9 @@ def determine_split(image_hash: str, train_ratio: float, val_ratio: float) -> st
 
 
 def select_split(image_hash: str, label: str, counts: dict, target_count: int, train_ratio: float, val_ratio: float):
+    if target_count <= 0:
+        return determine_split(image_hash, train_ratio, val_ratio)
+
     train_target = int(target_count * train_ratio)
     val_target = int(target_count * val_ratio)
     test_target = target_count - train_target - val_target
@@ -351,14 +419,18 @@ def select_split(image_hash: str, label: str, counts: dict, target_count: int, t
 def extract_exif(image_bytes: bytes) -> dict:
     try:
         img = Image.open(BytesIO(image_bytes))
-        raw_exif = img._getexif() or {}
+        raw_exif: Any = {}
+        exif_data = getattr(img, "getexif", None)
+        if callable(exif_data):
+            raw_exif = exif_data() or {}
         if not raw_exif:
             return {}
 
         exif = {}
-        for key, value in raw_exif.items():
-            name = ExifTags.TAGS.get(key, key)
-            exif[name] = value
+        if hasattr(raw_exif, "items"):
+            for key, value in cast(dict, raw_exif).items():
+                name = ExifTags.TAGS.get(key, key)
+                exif[name] = value
         return exif
     except Exception:
         return {}
@@ -410,6 +482,16 @@ def ensure_directory(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
 
+def next_image_index(directory: Path) -> int:
+    max_index = 0
+    if directory.exists():
+        for image_file in directory.iterdir():
+            if image_file.is_file() and image_file.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+                if image_file.stem.isdigit():
+                    max_index = max(max_index, int(image_file.stem))
+    return max_index + 1
+
+
 def build_source_list(args):
     source_urls = []
     source_label_map = {}
@@ -417,11 +499,13 @@ def build_source_list(args):
 
     def add_source_file(path: str, label: str):
         for url in read_source_urls(path):
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-            source_urls.append(url)
-            source_label_map[url] = label
+            for page_number in range(1, args.pages_per_source + 1):
+                expanded_url = expand_paginated_url(url, page_number)
+                if expanded_url in seen_urls:
+                    continue
+                seen_urls.add(expanded_url)
+                source_urls.append(expanded_url)
+                source_label_map[expanded_url] = label
 
     if args.real_sources:
         add_source_file(args.real_sources, "real")
@@ -430,21 +514,30 @@ def build_source_list(args):
 
     if not args.real_sources and not args.ai_sources:
         for url in read_source_urls(args.sources):
-            if url not in seen_urls:
-                seen_urls.add(url)
-                source_urls.append(url)
-                source_label_map[url] = "unknown"
+            for page_number in range(1, args.pages_per_source + 1):
+                expanded_url = expand_paginated_url(url, page_number)
+                if expanded_url not in seen_urls:
+                    seen_urls.add(expanded_url)
+                    source_urls.append(expanded_url)
+                    source_label_map[expanded_url] = "unknown"
     elif args.sources and os.path.exists(args.sources):
         for url in read_source_urls(args.sources):
-            if url not in seen_urls:
-                seen_urls.add(url)
-                source_urls.append(url)
-                source_label_map[url] = "unknown"
+            for page_number in range(1, args.pages_per_source + 1):
+                expanded_url = expand_paginated_url(url, page_number)
+                if expanded_url not in seen_urls:
+                    seen_urls.add(expanded_url)
+                    source_urls.append(expanded_url)
+                    source_label_map[expanded_url] = "unknown"
 
-    return source_urls[: args.max_pages], source_label_map
+    if args.max_pages > 0:
+        return source_urls[: args.max_pages], source_label_map
+    return source_urls, source_label_map
 
 
 def dataset_filled(counts: dict, target_count: int, train_ratio: float, val_ratio: float) -> bool:
+    if target_count <= 0:
+        return False
+
     train_target = int(target_count * train_ratio)
     val_target = int(target_count * val_ratio)
     test_target = target_count - train_target - val_target
@@ -497,11 +590,28 @@ def main():
     args = parse_arguments()
     if args.train_ratio < 0 or args.val_ratio < 0 or args.train_ratio + args.val_ratio >= 1.0:
         raise ValueError("train-ratio and val-ratio must sum to less than 1.0 and be non-negative.")
+    if args.pages_per_source < 1:
+        raise ValueError("pages-per-source must be at least 1.")
+    if args.max_pages < 0:
+        raise ValueError("max-pages must be 0 or greater.")
+    if args.max_images_per_page < 0:
+        raise ValueError("max-images-per-page must be 0 or greater.")
+    if args.target_new_images < 1:
+        raise ValueError("target-new-images must be at least 1.")
+    if args.target_count < 0:
+        raise ValueError("target-count must be 0 or greater.")
 
     random.seed(args.random_seed)
     source_urls, source_label_map = build_source_list(args)
     output_dir = Path(args.output_dir)
     metadata_dir = output_dir / "metadata"
+
+    if args.fresh:
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        if Path(args.csv).exists():
+            Path(args.csv).unlink()
+
     ensure_directory(output_dir)
     ensure_directory(metadata_dir)
 
@@ -523,11 +633,19 @@ def main():
                     continue
 
     session = create_session(args.max_retries, args.backoff_factor)
+    added_this_run = 0
+    downloaded_this_run = 0
+    skipped_duplicates = 0
 
     for page_index, page_url in enumerate(source_urls, start=1):
+        if added_this_run >= args.target_new_images:
+            print(f"Per-run target reached: {added_this_run}/{args.target_new_images} new images.")
+            break
+
         print(f"[{page_index}/{len(source_urls)}] Scraping page: {page_url}")
-        if not is_allowed_by_robots(page_url, user_agent=HEADERS["User-Agent"]):
+        if not args.ignore_robots and not is_allowed_by_robots(page_url, user_agent=HEADERS["User-Agent"]):
             print(f"  Skipping due to robots.txt rules: {page_url}")
+            print("  Use --ignore-robots to override this behavior if you understand the policy implications.")
             continue
 
         if dataset_filled(counts, args.target_count, args.train_ratio, args.val_ratio):
@@ -545,14 +663,20 @@ def main():
             print("  No images found on this page.")
             continue
 
-        for record_index, image_record in enumerate(images[: args.max_images_per_page], start=1):
+        images_to_process = images if args.max_images_per_page == 0 else images[: args.max_images_per_page]
+        for record_index, image_record in enumerate(images_to_process, start=1):
+            if added_this_run >= args.target_new_images:
+                print(f"Per-run target reached: {added_this_run}/{args.target_new_images} new images.")
+                break
+
             if dataset_filled(counts, args.target_count, args.train_ratio, args.val_ratio):
                 print("Target counts for all labels and splits reached. Stopping early.")
                 break
 
-            print(f"  [{record_index}/{min(len(images), args.max_images_per_page)}] {image_record['image_url']}")
+            print(f"  [{record_index}/{len(images_to_process)}] {image_record['image_url']}")
             try:
                 image_bytes = download_image(image_record["image_url"], session, timeout=args.timeout)
+                downloaded_this_run += 1
             except Exception as exc:
                 print(f"    Download failed: {exc}")
                 continue
@@ -562,6 +686,7 @@ def main():
 
             if image_hash in existing_hashes:
                 print("    Exact duplicate image skipped.")
+                skipped_duplicates += 1
                 continue
 
             duplicate_found = False
@@ -571,6 +696,7 @@ def main():
                     duplicate_found = True
                     break
             if duplicate_found:
+                skipped_duplicates += 1
                 continue
 
             exif = extract_exif(image_bytes)
@@ -591,7 +717,8 @@ def main():
                 continue
 
             image_id += 1
-            relative_path = output_dir / label / split / f"{image_id}.jpg"
+            local_index = next_image_index(output_dir / label / split)
+            relative_path = output_dir / label / split / f"{local_index}.jpg"
             try:
                 resize_and_save_image(image_bytes, relative_path, args.size)
             except Exception as exc:
@@ -599,6 +726,7 @@ def main():
                 continue
 
             counts[label][split] += 1
+            added_this_run += 1
             existing_hashes.add(image_hash)
             existing_phashes.append(perceptual_hash)
 
@@ -647,6 +775,15 @@ def main():
     print(f"Dataset collection complete. CSV saved to: {args.csv}")
     print(f"Images saved to: {output_dir}")
     print(f"Metadata saved to: {metadata_dir}")
+    print(f"New images added this run: {added_this_run}/{args.target_new_images}")
+    print(f"Images downloaded this run: {downloaded_this_run}")
+    print(f"Duplicate images skipped this run: {skipped_duplicates}")
+    print(f"Current counts: {json.dumps(counts, sort_keys=True)}")
+    if added_this_run < args.target_new_images:
+        print(
+            "Warning: target-new-images was not reached. Add more source URLs, increase --pages-per-source, "
+            "raise --max-images-per-page, or lower duplicate strictness with --perceptual-threshold."
+        )
 
 
 if __name__ == "__main__":
